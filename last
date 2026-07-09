@@ -1,0 +1,3 @@
+#!/usr/bin/env bash
+# Show the most recent commit with its full diff.
+git show "$@"
