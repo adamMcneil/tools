@@ -1,0 +1,27 @@
+#!/usr/bin/env bash
+# Show the git history as a graph (all branches), one line per commit. Add -f to auto-refresh on new commits or branch switches.
+render() {
+  git log --graph --all --oneline --decorate \
+    --format='%C(auto)%h%d %s %C(dim white)%an, %ar' "$@"
+}
+
+if [ "$1" = "-f" ] || [ "$1" = "--follow" ]; then
+  shift
+  last=""
+  while true; do
+    # Fingerprint of all ref tips plus HEAD's identity — for-each-ref alone misses a checkout
+    # that doesn't move any ref (e.g. switching to a branch/commit that's already up to date).
+    current="$(git for-each-ref --format='%(refname) %(objectname)' 2>/dev/null
+      git symbolic-ref -q HEAD 2>/dev/null
+      git rev-parse -q --verify HEAD 2>/dev/null)"
+    if [ "$current" != "$last" ]; then
+      clear
+      render "$@"
+      printf '\n\033[2m-- watching for commits & branch switches, updated %s, Ctrl-C to stop --\033[0m\n' "$(date +%H:%M:%S)"
+      last="$current"
+    fi
+    sleep 1
+  done
+else
+  render "$@"
+fi

@@ -1,0 +1,8 @@
+#!/usr/bin/env bash
+# List files/folders in the current directory whose name matches the given text (case-insensitive).
+# Usage: search <text>      e.g.  search do
+if [ -z "$1" ]; then
+  echo "usage: search <text>" >&2
+  exit 1
+fi
+ls -A | grep -i "$1"

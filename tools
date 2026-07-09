@@ -1,0 +1,10 @@
+#!/usr/bin/env bash
+# List every script in this folder with its one-line description.
+dir="$(cd "$(dirname "$0")" && pwd)"
+for f in "$dir"/*; do
+  [ -f "$f" ] && [ -x "$f" ] || continue
+  name="$(basename "$f")"
+  # Grab the first comment line that isn't the shebang.
+  desc="$(grep -m1 '^# ' "$f" | sed 's/^# //')"
+  printf '%-12s %s\n' "$name" "$desc"
+done
