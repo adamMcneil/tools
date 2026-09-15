@@ -1,0 +1,341 @@
+#!/usr/bin/env python3
+# Convert a MySQL option file (my.cnf / .my.cnf / .mylogin.cnf) into a connection string (uri, ado, odbc, jdbc, sqlalchemy, go).
+"""
+Reads the [client] and [mysql] groups the way the mysql CLI does (later groups
+win), follows !include / !includedir, decrypts .mylogin.cnf login-path files,
+and prints the result as a connection string.
+
+Examples:
+  string                                 # ~/.my.cnf, every format labelled
+  string prod.cnf -f ado                 # MySqlConnector / Connector/NET
+  string prod.cnf -f uri -d shop         # mysql://user:pass@host:3306/shop
+  string ~/.mylogin.cnf -g prod -f jdbc  # login-path "prod"
+  cat my.cnf | string - -f go --mask
+"""
+import argparse
+import glob
+import os
+import sys
+from urllib.parse import quote
+
+FORMATS = ("uri", "ado", "odbc", "jdbc", "sqlalchemy", "go")
+MASK = "*****"
+MAX_INCLUDE_DEPTH = 10
+
+# ---------------------------------------------------------------- parsing ---
+
+_ESCAPES = {"n": "\n", "t": "\t", "r": "\r", "b": "\b", "s": " ",
+            '"': '"', "'": "'", "\\": "\\"}
+
+
+def unescape(value):
+    """Apply the backslash escapes libmysqlclient understands in option files."""
+    out, i = [], 0
+    while i < len(value):
+        ch = value[i]
+        if ch == "\\" and i + 1 < len(value) and value[i + 1] in _ESCAPES:
+            out.append(_ESCAPES[value[i + 1]])
+            i += 2
+        else:
+            out.append(ch)
+            i += 1
+    return "".join(out)
+
+
+def parse_value(raw):
+    raw = raw.strip()
+    if not raw:
+        return ""
+    if raw[0] in "\"'":
+        q, i = raw[0], 1
+        while i < len(raw) and raw[i] != q:
+            i += 2 if raw[i] == "\\" else 1
+        return unescape(raw[1:i])
+    # Unquoted: a '#' starts a trailing comment.
+    return unescape(raw.split("#", 1)[0].rstrip())
+
+
+def normalize_key(key):
+    key = key.strip().lower().replace("-", "_")
+    if key.startswith("loose_"):
+        key = key[6:]
+    return key
+
+
+def read_source(path):
+    if path == "-":
+        return sys.stdin.read()
+    with open(path, "rb") as fh:
+        data = fh.read()
+    if len(data) >= 24 and data[:4] == b"\0\0\0\0":
+        return decrypt_mylogin(data, path)
+    try:
+        return data.decode("utf-8")
+    except UnicodeDecodeError:
+        return data.decode("latin-1")
+
+
+def decrypt_mylogin(data, path):
+    """Decode a mysql_config_editor login-path file (AES-128-ECB, key stored in the file)."""
+    try:
+        from cryptography.hazmat.primitives.ciphers import Cipher, algorithms, modes
+    except ImportError:
+        sys.exit(f"string: {path} is an encrypted login-path file; decrypting it needs the "
+                 "python 'cryptography' module (apt install python3-cryptography)")
+    key = bytearray(16)
+    for i, b in enumerate(data[4:24]):
+        key[i % 16] ^= b
+    cipher = Cipher(algorithms.AES(bytes(key)), modes.ECB())
+    lines, pos = [], 24
+    while pos + 4 <= len(data):
+        length = int.from_bytes(data[pos:pos + 4], "little")
+        chunk = data[pos + 4:pos + 4 + length]
+        pos += 4 + length
+        dec = cipher.decryptor()
+        plain = dec.update(chunk) + dec.finalize()
+        if plain and 1 <= plain[-1] <= 16:          # strip PKCS#7 padding
+            plain = plain[:-plain[-1]]
+        lines.append(plain.decode("utf-8", "replace"))
+    return "".join(lines)
+
+
+def parse_file(path, groups, depth=0):
+    """Populate groups {name: {key: value}} from an option file, following includes."""
+    if depth > MAX_INCLUDE_DEPTH:
+        sys.exit(f"string: !include nesting too deep at {path}")
+    base = os.path.dirname(os.path.abspath(path)) if path != "-" else os.getcwd()
+    current = None
+    for raw in read_source(path).splitlines():
+        line = raw.strip()
+        if not line or line[0] in "#;":
+            continue
+        if line.startswith("!"):
+            directive, _, target = line.partition(" ")
+            target = os.path.expanduser(target.strip())
+            if not os.path.isabs(target):
+                target = os.path.join(base, target)
+            if directive == "!include":
+                parse_file(target, groups, depth + 1)
+            elif directive == "!includedir":
+                for inc in sorted(glob.glob(os.path.join(target, "*.cnf"))
+                                  + glob.glob(os.path.join(target, "*.ini"))):
+                    parse_file(inc, groups, depth + 1)
+            continue
+        if line[0] == "[":
+            current = line[1:line.find("]")].strip().lower()
+            groups.setdefault(current, {})
+            continue
+        if current is None:
+            continue
+        key, has_value, value = line.partition("=")
+        key = normalize_key(key)
+        if has_value:
+            value = parse_value(value)
+        elif key == "password":
+            continue                                  # bare 'password' means "prompt"
+        elif key.startswith(("skip_", "disable_")):
+            key, value = key.split("_", 1)[1], "0"
+        elif key.startswith("enable_"):
+            key, value = key[7:], "1"
+        else:
+            value = "1"
+        groups[current][key] = value
+
+
+# ------------------------------------------------------------ connection ---
+
+SSL_MODES = ("DISABLED", "PREFERRED", "REQUIRED", "VERIFY_CA", "VERIFY_IDENTITY")
+
+
+class Conn:
+    def __init__(self, opts):
+        self.host = opts.get("host")
+        self.port = opts.get("port")
+        self.user = opts.get("user")
+        self.password = opts.get("password")
+        self.database = opts.get("database")
+        self.socket = opts.get("socket") if opts.get("protocol", "").lower() != "tcp" else None
+        self.charset = opts.get("default_character_set") or opts.get("charset")
+        self.ssl_ca = opts.get("ssl_ca")
+        self.ssl_cert = opts.get("ssl_cert")
+        self.ssl_key = opts.get("ssl_key")
+        self.odbc_driver = opts.get("driver", "MySQL ODBC 8.0 Unicode Driver")
+        mode = (opts.get("ssl_mode") or "").upper().replace("-", "_")
+        if opts.get("ssl") == "0":
+            mode = "DISABLED"
+        if mode and mode not in SSL_MODES:
+            print(f"string: warning: unknown ssl-mode '{mode}'", file=sys.stderr)
+        self.ssl_mode = mode or None
+
+    @property
+    def uses_socket(self):
+        return bool(self.socket) and self.host in (None, "localhost")
+
+
+def enc(value):
+    return value if value == MASK else quote(value, safe="")
+
+
+def query(pairs, sep="&"):
+    items = [f"{k}={enc(v)}" for k, v in pairs if v]
+    return ("?" + sep.join(items)) if items else ""
+
+
+def kv_join(pairs, quoter):
+    return ";".join(f"{k}={quoter(v)}" for k, v in pairs if v is not None and v != "")
+
+
+def uri_authority(c, encode_userinfo=True):
+    auth = ""
+    if c.user:
+        auth = enc(c.user) if encode_userinfo else c.user
+        if c.password is not None:
+            auth += ":" + (enc(c.password) if encode_userinfo else c.password)
+        auth += "@"
+    host = c.host or "localhost"
+    if ":" in host and not host.startswith("["):
+        host = f"[{host}]"
+    return auth + host + (f":{c.port}" if c.port else "")
+
+
+def fmt_uri(c):
+    q = query([("ssl-mode", c.ssl_mode), ("ssl-ca", c.ssl_ca), ("ssl-cert", c.ssl_cert),
+               ("ssl-key", c.ssl_key), ("socket", c.socket if c.uses_socket else None)])
+    path = f"/{enc(c.database)}" if c.database else ("/" if q else "")
+    return f"mysql://{uri_authority(c)}{path}{q}"
+
+
+def ado_quote(v):
+    if not v or not (";" in v or "=" in v or v[0] in " '\"" or v[-1] == " "):
+        return v
+    if '"' in v and "'" not in v:
+        return f"'{v}'"
+    return '"' + v.replace('"', '""') + '"'
+
+
+ADO_SSL = {"DISABLED": "None", "PREFERRED": "Preferred", "REQUIRED": "Required",
+           "VERIFY_CA": "VerifyCA", "VERIFY_IDENTITY": "VerifyFull"}
+
+
+def fmt_ado(c):
+    pairs = [("Server", c.socket if c.uses_socket else (c.host or "localhost"))]
+    if c.uses_socket:
+        pairs.append(("Protocol", "Unix"))
+    else:
+        pairs.append(("Port", c.port))
+    pairs += [("Database", c.database), ("User ID", c.user), ("Password", c.password),
+              ("SslMode", ADO_SSL.get(c.ssl_mode)), ("SslCa", c.ssl_ca),
+              ("SslCert", c.ssl_cert), ("SslKey", c.ssl_key), ("CharSet", c.charset)]
+    return kv_join(pairs, ado_quote) + ";"
+
+
+def odbc_quote(v):
+    if not v or not (";" in v or "{" in v or "}" in v or v[0] == " " or v[-1] == " "):
+        return v
+    return "{" + v + "}"
+
+
+def fmt_odbc(c):
+    pairs = [("Driver", "{" + c.odbc_driver + "}"), ("Server", c.host or "localhost"),
+             ("Port", c.port), ("Socket", c.socket if c.uses_socket else None),
+             ("Database", c.database), ("User", c.user), ("Password", c.password),
+             ("SslMode", c.ssl_mode), ("SslCa", c.ssl_ca), ("SslCert", c.ssl_cert),
+             ("SslKey", c.ssl_key), ("Charset", c.charset)]
+    out = [f"{k}={v if k == 'Driver' else odbc_quote(v)}" for k, v in pairs if v]
+    return ";".join(out) + ";"
+
+
+def fmt_jdbc(c):
+    host = c.host or "localhost"
+    if ":" in host and not host.startswith("["):
+        host = f"[{host}]"
+    hostport = host + (f":{c.port}" if c.port else "")
+    q = query([("user", c.user), ("password", c.password), ("sslMode", c.ssl_mode)])
+    return f"jdbc:mysql://{hostport}/{enc(c.database) if c.database else ''}{q}"
+
+
+def fmt_sqlalchemy(c):
+    flags = {"DISABLED": ("ssl_disabled", "true"), "VERIFY_CA": ("ssl_verify_cert", "true"),
+             "VERIFY_IDENTITY": ("ssl_verify_identity", "true")}
+    pairs = [("charset", c.charset), ("unix_socket", c.socket if c.uses_socket else None),
+             ("ssl_ca", c.ssl_ca), ("ssl_cert", c.ssl_cert), ("ssl_key", c.ssl_key)]
+    if c.ssl_mode in flags:
+        pairs.append(flags[c.ssl_mode])
+    db = f"/{enc(c.database)}" if c.database else "/"
+    return f"mysql+pymysql://{uri_authority(c)}{db}{query(pairs)}"
+
+
+def fmt_go(c):
+    auth = ""
+    if c.user:
+        auth = c.user + (f":{c.password}" if c.password is not None else "") + "@"
+    if c.uses_socket:
+        net = f"unix({c.socket})"
+    else:
+        host = c.host or "localhost"
+        if ":" in host and not host.startswith("["):
+            host = f"[{host}]"
+        net = f"tcp({host}:{c.port})" if c.port else f"tcp({host})"
+    tls = {"DISABLED": "false", "PREFERRED": "preferred", "REQUIRED": "skip-verify",
+           "VERIFY_CA": "true", "VERIFY_IDENTITY": "true"}.get(c.ssl_mode)
+    return f"{auth}{net}/{c.database or ''}{query([('charset', c.charset), ('tls', tls)])}"
+
+
+FORMATTERS = {"uri": fmt_uri, "ado": fmt_ado, "odbc": fmt_odbc, "jdbc": fmt_jdbc,
+              "sqlalchemy": fmt_sqlalchemy, "go": fmt_go}
+
+# ------------------------------------------------------------------- main ---
+
+
+def main():
+    ap = argparse.ArgumentParser(
+        prog="string", description=__doc__,
+        formatter_class=argparse.RawDescriptionHelpFormatter)
+    ap.add_argument("file", nargs="?", default=os.path.expanduser("~/.my.cnf"),
+                    help="option file to read (default: ~/.my.cnf; '-' reads stdin)")
+    ap.add_argument("-g", "--groups", default="client,mysql",
+                    help="comma-separated groups to merge, later ones win (default: client,mysql)")
+    ap.add_argument("-f", "--format", choices=FORMATS,
+                    help="print just this format as a bare string (default: all, labelled)")
+    ap.add_argument("-d", "--database", help="set or override the database name")
+    ap.add_argument("-s", "--set", action="append", default=[], metavar="KEY=VALUE",
+                    help="set or override any option, e.g. -s host=127.0.0.1 (repeatable)")
+    ap.add_argument("--mask", action="store_true", help=f"replace the password with {MASK}")
+    args = ap.parse_args()
+
+    if args.file != "-" and not os.path.exists(args.file):
+        sys.exit(f"string: {args.file}: no such file")
+
+    groups = {}
+    parse_file(args.file, groups)
+
+    wanted = [g.strip().lower() for g in args.groups.split(",") if g.strip()]
+    found = [g for g in wanted if g in groups]
+    if not found:
+        have = ", ".join(f"[{g}]" for g in groups) or "none"
+        sys.exit(f"string: no {' / '.join(f'[{g}]' for g in wanted)} group in {args.file} "
+                 f"(groups present: {have})")
+
+    opts = {}
+    for g in found:
+        opts.update(groups[g])
+    for item in args.set:
+        key, has_value, value = item.partition("=")
+        if not has_value:
+            sys.exit(f"string: --set expects KEY=VALUE, got '{item}'")
+        opts[normalize_key(key)] = value
+    if args.database:
+        opts["database"] = args.database
+    if args.mask and "password" in opts:
+        opts["password"] = MASK
+
+    conn = Conn(opts)
+    if args.format:
+        print(FORMATTERS[args.format](conn))
+    else:
+        for name in FORMATS:
+            print(f"{name:<11}{FORMATTERS[name](conn)}")
+
+
+if __name__ == "__main__":
+    main()
