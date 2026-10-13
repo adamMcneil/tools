@@ -1,10 +1,20 @@
 #!/usr/bin/env bash
-# List every script in this folder with its one-line description.
+# List the other scripts in this folder with their one-line descriptions.
 dir="$(cd "$(dirname "$0")" && pwd)"
+self="$(basename "$0")"
+
+names=() descs=() width=0
 for f in "$dir"/*; do
   [ -f "$f" ] && [ -x "$f" ] || continue
   name="$(basename "$f")"
-  # Grab the first comment line that isn't the shebang.
-  desc="$(grep -m1 '^# ' "$f" | sed 's/^# //')"
-  printf '%-12s %s\n' "$name" "$desc"
+  [ "$name" = "$self" ] && continue
+  # First comment in the header that isn't the shebang, minus any leading "name - ".
+  desc="$(head -n 5 "$f" | grep -m1 '^# ' | sed -e 's/^# //' -e "s/^$name *[-:] *//")"
+  names+=("$name")
+  descs+=("${desc:-(no description)}")
+  [ ${#name} -gt $width ] && width=${#name}
+done
+
+for i in "${!names[@]}"; do
+  printf '%-*s  %s\n' "$width" "${names[$i]}" "${descs[$i]}"
 done
