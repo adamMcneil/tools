@@ -3,3 +3,12 @@ __pycache__/
 *.egg-info/
 .venv/
 venv/
+
+# Claude Code (local worktrees and personal settings)
+.claude/worktrees/
+.claude/settings.local.json
+
+# Editor / OS
+*.swp
+*~
+.DS_Store
