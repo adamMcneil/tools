@@ -1,0 +1,18 @@
+#!/usr/bin/env bash
+# Move files/folders from WSL to the Windows Desktop.
+# Usage: mtw <file>...      e.g.  mtw report.pdf *.csv
+# Asks before overwriting anything already on the Desktop.
+if [ $# -eq 0 ]; then
+  echo "usage: mtw <file>..." >&2
+  exit 1
+fi
+
+# Ask Windows where the Desktop is (handles OneDrive-redirected Desktops).
+win_desktop="$(powershell.exe -NoProfile -Command "[Environment]::GetFolderPath('Desktop')" 2>/dev/null | tr -d '\r')"
+if [ -z "$win_desktop" ]; then
+  echo "mtw: could not find the Windows Desktop" >&2
+  exit 1
+fi
+desktop="$(wslpath -u "$win_desktop")"
+
+mv -iv -- "$@" "$desktop"/

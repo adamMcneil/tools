@@ -1,0 +1,141 @@
+#!/usr/bin/env bash
+# Clear Claude Code history (conversations, prompts, edit undo, sessions) — keeps config/credentials/plugins/skills.
+# Usage: clean-claude [targets...] [options]
+#   Targets (none given = all history except --json):
+#     -t, --transcripts   conversation transcripts (projects/) — powers --resume / --continue
+#     -p, --prompts       up-arrow prompt history (history.jsonl)
+#     -e, --edits         file edit undo history (file-history/)
+#     -s, --sessions      shell snapshots + session env + todos
+#     -j, --json          strip prompt history from ~/.claude.json (needs jq; keeps the rest of the config)
+#     -a, --all           all of the above except --json
+#   Options:
+#     -n, --dry-run       show what would be cleared, delete nothing
+#     -b, --backup        tar.gz the selected paths into ~ before deleting
+#     -y, --yes           skip the confirmation prompt
+#     -h, --help          show this help
+set -euo pipefail
+
+CLAUDE_DIR="${CLAUDE_CONFIG_DIR:-$HOME/.claude}"
+JSON_FILE="$HOME/.claude.json"
+
+usage() { sed -n '2,20{/^#/{s/^# \{0,1\}//;p}}' "$0"; }
+
+# --- parse args ---
+want_transcripts=0 want_prompts=0 want_edits=0 want_sessions=0 want_json=0
+dry_run=0 do_backup=0 assume_yes=0 picked=0
+
+while [ $# -gt 0 ]; do
+  case "$1" in
+    -t|--transcripts) want_transcripts=1; picked=1 ;;
+    -p|--prompts)     want_prompts=1;     picked=1 ;;
+    -e|--edits)       want_edits=1;       picked=1 ;;
+    -s|--sessions)    want_sessions=1;    picked=1 ;;
+    -j|--json)        want_json=1;        picked=1 ;;
+    -a|--all)         want_transcripts=1; want_prompts=1; want_edits=1; want_sessions=1; picked=1 ;;
+    -n|--dry-run)     dry_run=1 ;;
+    -b|--backup)      do_backup=1 ;;
+    -y|--yes)         assume_yes=1 ;;
+    -h|--help)        usage; exit 0 ;;
+    *) echo "clean-claude: unknown option '$1'" >&2; echo "try: clean-claude --help" >&2; exit 1 ;;
+  esac
+  shift
+done
+
+# No target flags => clear everything except the config-file edit.
+if [ "$picked" -eq 0 ]; then
+  want_transcripts=1; want_prompts=1; want_edits=1; want_sessions=1
+fi
+
+# --- build the work lists ---
+DIRS=()   # directories whose CONTENTS get removed (the dir itself stays)
+FILES=()  # individual files to remove
+[ "$want_transcripts" -eq 1 ] && DIRS+=("$CLAUDE_DIR/projects")
+[ "$want_edits" -eq 1 ]       && DIRS+=("$CLAUDE_DIR/file-history")
+[ "$want_sessions" -eq 1 ]    && DIRS+=("$CLAUDE_DIR/shell-snapshots" "$CLAUDE_DIR/session-env" "$CLAUDE_DIR/todos")
+[ "$want_prompts" -eq 1 ]     && FILES+=("$CLAUDE_DIR/history.jsonl")
+
+# --- show the plan ---
+echo "About to clear (config, credentials, settings, plugins and skills are left untouched):"
+echo
+have_something=0
+for d in ${DIRS[@]+"${DIRS[@]}"}; do
+  if [ -d "$d" ] && find "$d" -mindepth 1 -print -quit | grep -q .; then
+    printf '  %-8s %s/*\n' "$(du -sh "$d" 2>/dev/null | cut -f1)" "$d"; have_something=1
+  fi
+done
+for f in ${FILES[@]+"${FILES[@]}"}; do
+  if [ -f "$f" ]; then
+    printf '  %-8s %s\n' "$(du -h "$f" 2>/dev/null | cut -f1)" "$f"; have_something=1
+  fi
+done
+if [ "$want_json" -eq 1 ]; then
+  if command -v jq >/dev/null 2>&1 && [ -f "$JSON_FILE" ]; then
+    printf '  %-8s strip prompt history from %s (config preserved)\n' "edit" "$JSON_FILE"; have_something=1
+  else
+    echo "  (skip)   --json needs jq and ~/.claude.json; skipping" >&2
+    want_json=0
+  fi
+fi
+
+if [ "$have_something" -eq 0 ]; then
+  echo "  (nothing to clear)"
+  exit 0
+fi
+
+if [ "$dry_run" -eq 1 ]; then
+  echo
+  echo "Dry run — nothing was deleted."
+  exit 0
+fi
+
+echo
+echo "Note: quit other Claude Code sessions first; resuming past conversations will no longer be possible."
+
+# --- confirm ---
+if [ "$assume_yes" -eq 0 ]; then
+  printf 'Proceed? [y/N] '
+  read -r ans
+  case "$ans" in
+    y|Y|yes|YES) ;;
+    *) echo "Aborted."; exit 1 ;;
+  esac
+fi
+
+# --- backup (optional) ---
+if [ "$do_backup" -eq 1 ]; then
+  stamp="$(date +%Y%m%d-%H%M%S)"
+  backup="$HOME/claude-history-backup-$stamp.tar.gz"
+  rel=()
+  for p in ${DIRS[@]+"${DIRS[@]}"} ${FILES[@]+"${FILES[@]}"}; do
+    [ -e "$p" ] && rel+=("${p#"$HOME"/}")
+  done
+  [ "$want_json" -eq 1 ] && [ -f "$JSON_FILE" ] && rel+=("${JSON_FILE#"$HOME"/}")
+  if [ "${#rel[@]}" -gt 0 ]; then
+    tar czf "$backup" -C "$HOME" "${rel[@]}"
+    echo "Backup: $backup"
+  fi
+fi
+
+# --- delete ---
+for d in ${DIRS[@]+"${DIRS[@]}"}; do
+  [ -d "$d" ] || continue
+  find "$d" -mindepth 1 -maxdepth 1 -exec rm -rf {} +
+  echo "Cleared $d/"
+done
+for f in ${FILES[@]+"${FILES[@]}"}; do
+  [ -f "$f" ] || continue
+  rm -f "$f"
+  echo "Removed $f"
+done
+
+# --- strip ~/.claude.json prompt history (keep the rest of the config) ---
+if [ "$want_json" -eq 1 ]; then
+  cp "$JSON_FILE" "$JSON_FILE.bak-$(date +%Y%m%d-%H%M%S)"
+  tmp="$(mktemp)"
+  jq '(if .projects then .projects |= map_values(if has("history") then .history = [] else . end) else . end)
+      | (if has("history") then .history = [] else . end)' "$JSON_FILE" > "$tmp"
+  mv "$tmp" "$JSON_FILE"
+  echo "Stripped prompt history from $JSON_FILE (backup kept alongside it)"
+fi
+
+echo "Done."
