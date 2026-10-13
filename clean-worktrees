@@ -1,28 +1,38 @@
 #!/usr/bin/env bash
 # Remove the git worktrees of the repo you're in — skips ones with uncommitted work, live Claude sessions, or in use.
 # Usage: clean-worktrees [options]      (run from anywhere inside the repo or one of its worktrees)
-#   -n, --dry-run    show what would be removed, delete nothing
-#   -b, --branches   also delete each removed worktree's branch, if it's merged or pushed (nothing is lost)
-#   -f, --force      also remove worktrees with uncommitted work (and, with -b, unmerged branches)
-#   -y, --yes        skip the confirmation prompt
-#   -h, --help       show this help
-# Never touched: the main checkout, the worktree you're standing in, worktrees a running process
-# is sitting in, live Claude Code sessions, and worktrees locked by hand (git worktree unlock <path>).
-# Worktrees whose folder was already deleted are pruned from git's list.
+#   -n, --dry-run               show what would be removed, delete nothing
+#   -b, --branches              also delete each removed worktree's branch, if it's merged or pushed (nothing is lost)
+#   -f, --force                 also remove worktrees with uncommitted work (and, with -b, unmerged branches)
+#   -F, --force-remove <name>   remove this worktree no matter what (folder name, path or branch; repeatable)
+#   -A, --all                   remove EVERY worktree no matter what — live sessions, locks, uncommitted work, all of it
+#   -y, --yes                   skip the confirmation prompt
+#   -h, --help                  show this help
+# Unless forced with -F or -A, never touched: the worktree you're standing in, worktrees a running process
+# is sitting in, live Claude Code sessions, and worktrees locked by hand. The main checkout is never touched.
+# Worktrees whose folder was already deleted are pruned from git's list. With -b, forced worktrees lose
+# their branch too, merged or not.
+# Examples:  clean-worktrees -n    clean-worktrees -by    clean-worktrees -F tools-lister    clean-worktrees -Aby
 set -euo pipefail
 
-usage() { sed -n '2,11{/^#/{s/^# \{0,1\}//;p}}' "$0"; }
+usage() { sed -n '2,/^[^#]/{/^#/{s/^# \{0,1\}//;p}}' "$0"; }
+die() { echo "clean-worktrees: $*" >&2; exit 1; }
 
 # --- parse args ---
-dry_run=0 do_branches=0 force=0 assume_yes=0
+dry_run=0 do_branches=0 force=0 force_all=0 assume_yes=0 FORCE_NAMES=()
 while [ $# -gt 0 ]; do
   case "$1" in
     -n|--dry-run)  dry_run=1 ;;
     -b|--branches) do_branches=1 ;;
     -f|--force)    force=1 ;;
+    -F|--force-remove)
+      [ $# -ge 2 ] || die "$1 needs a worktree (folder name, path or branch)"
+      FORCE_NAMES+=("$2"); shift ;;
+    --force-remove=*) FORCE_NAMES+=("${1#*=}") ;;
+    -A|--all)      force_all=1 ;;
     -y|--yes)      assume_yes=1 ;;
     -h|--help)     usage; exit 0 ;;
-    -[a-z][a-z]*)  # bundled short flags: -by => -b -y
+    -[a-zA-Z][a-zA-Z]*)  # bundled short flags: -by => -b -y
       bundle="${1#-}"; shift; split=()
       while [ -n "$bundle" ]; do split+=("-${bundle:0:1}"); bundle="${bundle:1}"; done
       set -- "${split[@]}" "$@"; continue ;;
@@ -31,10 +41,7 @@ while [ $# -gt 0 ]; do
   shift
 done
 
-if ! git rev-parse --git-dir >/dev/null 2>&1; then
-  echo "clean-worktrees: not inside a git repository ($PWD)" >&2
-  exit 1
-fi
+git rev-parse --git-dir >/dev/null 2>&1 || die "not inside a git repository ($PWD)"
 
 # --- read git's worktree list (first entry is the main checkout) ---
 WT_PATH=() WT_HEAD=() WT_BRANCH=() WT_LOCKED=() WT_LOCK=() WT_GONE=()
@@ -59,11 +66,6 @@ g() { git -C "$main_wt" "$@"; }
 base_sha="$(g rev-parse -q --verify HEAD 2>/dev/null || true)"
 base_name="$(g rev-parse --abbrev-ref HEAD 2>/dev/null || echo HEAD)"
 
-if [ "${#WT_PATH[@]}" -le 1 ]; then
-  echo "No worktrees to clean in $main_wt (only the main checkout)."
-  exit 0
-fi
-
 # --- helpers ---
 show_path() {  # inside the repo: relative; next to it: ../name; else ~-abbreviated
   case "$1" in
@@ -74,6 +76,14 @@ show_path() {  # inside the repo: relative; next to it: ../name; else ~-abbrevia
   esac
 }
 
+# Does the name given to -F refer to worktree $1? Accepts its path, folder name, or branch.
+names_worktree() {
+  local wt="${WT_PATH[$1]}" name="${2%/}" abs
+  abs="$(realpath -m -- "$name" 2>/dev/null || true)"
+  [[ $name == "$wt" || $abs == "$wt" || $name == "${SHOW[$1]}" || $name == "${wt##*/}" ]] ||
+    [[ -n ${WT_BRANCH[$1]} && $name == "${WT_BRANCH[$1]}" ]]
+}
+
 # Every process's working directory, as "pid<TAB>cwd" lines (Linux/WSL; empty elsewhere).
 PROC_CWDS=""
 if [ -d /proc/self ]; then
@@ -82,11 +92,15 @@ fi
 
 # Print "pid (command)" of a process whose working directory is inside $1; fail if there is none.
 process_in() {
-  local pid cwd
+  local pid cwd cmd args
   while IFS=$'\t' read -r pid cwd; do
     [ -n "$cwd" ] || continue
     if [[ $cwd == "$1" || $cwd == "$1"/* ]]; then
-      printf '%s (%s)' "$pid" "$(ps -o comm= -p "$pid" 2>/dev/null || echo '?')"
+      cmd="$(ps -o comm= -p "$pid" 2>/dev/null || echo '?')"
+      # Claude Code's binary is named after its version (…/claude/versions/2.1.296)
+      args="$(ps -o args= -p "$pid" 2>/dev/null || true)"
+      [[ $args == "claude "* || $args == */claude/* ]] && cmd="claude"
+      printf '%s (%s)' "$pid" "$cmd"
       return 0
     fi
   done <<<"$PROC_CWDS"
@@ -120,39 +134,76 @@ branch_state() {
   B_SAFE=0; B_DESC="has $n commit(s) not in $base_name"
 }
 
+# Only ever called on a forced worktree git refused to remove: never the main checkout or anything holding it.
+safe_to_rm() {
+  [ -n "$1" ] && [ "$1" != / ] && [ "$1" != "$HOME" ] && [[ $main_wt != "$1" && $main_wt != "$1"/* ]]
+}
+
+# --- which worktrees are forced (-A, or named with -F) ---
+SHOW=() FORCED=()
+for ((k=0; k<${#WT_PATH[@]}; k++)); do SHOW[k]="$(show_path "${WT_PATH[k]}")"; FORCED[k]="$force_all"; done
+FORCED[0]=0
+for name in ${FORCE_NAMES[@]+"${FORCE_NAMES[@]}"}; do
+  hits=()
+  for ((k=0; k<${#WT_PATH[@]}; k++)); do names_worktree "$k" "$name" && hits+=("$k"); done
+  if [ "${#hits[@]}" -eq 0 ]; then
+    die "-F $name: no worktree by that folder name, path or branch (see: git worktree list)"
+  elif [ "${#hits[@]}" -gt 1 ]; then
+    die "-F $name: matches more than one worktree ($(for h in "${hits[@]}"; do printf '%s ' "${SHOW[h]}"; done)) — give its path"
+  elif [ "${hits[0]}" -eq 0 ]; then
+    die "-F $name: that's the main checkout, which can't be removed"
+  fi
+  FORCED[hits[0]]=1
+done
+
+if [ "${#WT_PATH[@]}" -le 1 ]; then
+  echo "No worktrees to clean in $main_wt (only the main checkout)."
+  exit 0
+fi
+
 # --- decide what to do with each linked worktree ---
-ACT=() SIZE=() SHOW=() BR=() WHY=() UNLOCK=() FORCE=() DEL_BR=()
-n_remove=0 n_branches=0 n_dirty_skipped=0 n_branch_hint=0
+# A "hard" reason (live session, lock, in use, you're in it) is only overridden by -F/-A;
+# uncommitted work is also overridden by -f.
+ACT=() SIZE=() BR=() WHY=() UNLOCK=() FORCE=() DEL_BR=() IN_HERE=()
+n_remove=0 n_branches=0 n_dirty_skipped=0 n_hard_skipped=0 n_branch_hint=0 n_branch_hint_lossy=0
 for ((k=1; k<${#WT_PATH[@]}; k++)); do
-  wt="${WT_PATH[k]}" b="${WT_BRANCH[k]}" lock="${WT_LOCK[k]}"
-  act="remove" why="" unlock=0 frc=0 del_br=0 notes=()
+  wt="${WT_PATH[k]}" b="${WT_BRANCH[k]}" lock="${WT_LOCK[k]}" forced="${FORCED[k]}"
+  act="remove" hard="" lost="" why="" unlock=0 frc=0 del_br=0 notes=()
 
-  SHOW[k]="$(show_path "$wt")"
   BR[k]="${b:-(detached)}"
-  if [ "${WT_GONE[k]}" -eq 1 ]; then SIZE[k]="-"; else SIZE[k]="$(du -sh "$wt" 2>/dev/null | cut -f1)"; fi
+  if [ -e "$wt" ]; then SIZE[k]="$(du -sh "$wt" 2>/dev/null | cut -f1)"; else SIZE[k]="-"; fi
+  if [[ $here == "$wt" || $here == "$wt"/* ]]; then IN_HERE[k]=1; else IN_HERE[k]=0; fi
 
-  if [ "${WT_LOCKED[k]}" -eq 1 ] && [[ $lock == "claude session "* ]]; then
-    if claude_session_alive "$lock"; then
-      act="skip"; why="live Claude session"
-      [[ $lock =~ pid\ ([0-9]+) ]] && why+=" (pid ${BASH_REMATCH[1]})"
+  if [ "${WT_LOCKED[k]}" -eq 1 ]; then
+    unlock=1   # a stale Claude lock, or a forced removal, has to lift the lock first
+    if [[ $lock != "claude session "* ]]; then
+      hard="locked${lock:+ ($lock)}"
+    elif claude_session_alive "$lock"; then
+      hard="live Claude session"
+      [[ $lock =~ pid\ ([0-9]+) ]] && hard+=" (pid ${BASH_REMATCH[1]})"
     else
-      unlock=1; notes+=("stale Claude lock")
+      notes+=("stale Claude lock")
     fi
-  elif [ "${WT_LOCKED[k]}" -eq 1 ]; then
-    act="skip"; why="locked${lock:+ ($lock)} — git worktree unlock it to allow"
   fi
 
-  if [ "$act" = "remove" ] && [ "${WT_GONE[k]}" -eq 1 ]; then
+  if [ "${WT_GONE[k]}" -eq 1 ] && [ ! -e "$wt" ]; then
     act="prune"; notes+=("folder already deleted")
-  elif [ "$act" = "remove" ] && [[ $here == "$wt" || $here == "$wt"/* ]]; then
-    act="skip"; why="you're in it"
-  elif [ "$act" = "remove" ] && user="$(process_in "$wt")"; then
-    act="skip"; why="in use by pid $user"
+  elif [ "${WT_GONE[k]}" -eq 1 ]; then  # folder is there but its .git link is gone
+    act="prune"
+    if [ "$forced" -eq 1 ]; then notes+=("broken worktree, folder deleted"); else notes+=("broken worktree — unregistered, folder kept"); fi
+  elif [ -z "$hard" ] && [ "${IN_HERE[k]}" -eq 1 ]; then
+    hard="you're in it"
+  elif [ -z "$hard" ] && user="$(process_in "$wt")"; then
+    hard="in use by pid $user"
+  fi
+
+  if [ -n "$hard" ] && [ "$forced" -eq 0 ]; then
+    act="skip"; why="$hard"; n_hard_skipped=$((n_hard_skipped+1))
   elif [ "$act" = "remove" ]; then
     # Uncommitted changes (incl. untracked files) — or commits only reachable from a detached HEAD.
     if changes="$(git -C "$wt" status --porcelain --ignore-submodules=none 2>/dev/null)"; then
       n_changed="$(grep -c . <<<"$changes" || true)"
-      [ "$n_changed" -gt 0 ] && lost="$n_changed uncommitted change(s)" || lost=""
+      [ "$n_changed" -gt 0 ] && lost="$n_changed uncommitted change(s)"
     else
       lost="git status failed"
     fi
@@ -160,7 +211,7 @@ for ((k=1; k<${#WT_PATH[@]}; k++)); do
       n_orphan="$(g rev-list --count "${WT_HEAD[k]}" --not --branches --remotes --tags 2>/dev/null || echo 0)"
       [ "$n_orphan" -gt 0 ] && lost="$n_orphan commit(s) on detached HEAD, not on any branch"
     fi
-    if [ -n "$lost" ] && [ "$force" -eq 1 ]; then
+    if [ -n "$lost" ] && { [ "$force" -eq 1 ] || [ "$forced" -eq 1 ]; }; then
       frc=1; notes+=("$lost — WILL BE LOST")
     elif [ -n "$lost" ]; then
       act="skip"; why="$lost (-f to remove anyway)"; n_dirty_skipped=$((n_dirty_skipped+1))
@@ -168,16 +219,22 @@ for ((k=1; k<${#WT_PATH[@]}; k++)); do
       notes+=("clean")
     fi
   fi
+  if [ "$act" != "skip" ] && [ "$forced" -eq 1 ]; then
+    frc=1; [ -n "$hard" ] && notes=("FORCED past: $hard" ${notes[@]+"${notes[@]}"})
+  fi
 
   # What happens to the branch once the worktree is gone.
   if [ "$act" != "skip" ] && [ -n "$b" ]; then
     branch_state "$b"
+    if [ "$force" -eq 1 ] || [ "$forced" -eq 1 ]; then br_force=1; else br_force=0; fi
     if [ "$do_branches" -eq 0 ]; then
       notes+=("branch $B_DESC")
-      [ "$B_SAFE" -eq 1 ] && n_branch_hint=$((n_branch_hint+1))
+      if [ "$B_SAFE" -eq 1 ]; then n_branch_hint=$((n_branch_hint+1))
+      elif [ "$br_force" -eq 1 ]; then n_branch_hint=$((n_branch_hint+1)); n_branch_hint_lossy=$((n_branch_hint_lossy+1))
+      fi
     elif [ "$B_SAFE" -eq 1 ]; then
       del_br=1; notes+=("delete branch ($B_DESC)")
-    elif [ "$force" -eq 1 ]; then
+    elif [ "$br_force" -eq 1 ]; then
       del_br=1; notes+=("delete branch — $B_DESC WILL BE LOST")
     else
       notes+=("keep branch ($B_DESC; -f to delete)")
@@ -204,11 +261,16 @@ for ((k=1; k<${#WT_PATH[@]}; k++)); do
   printf '  %-6s %5s  %-*s  %-*s  %s\n' "${ACT[k]}" "${SIZE[k]}" "$w_path" "${SHOW[k]}" "$w_br" "${BR[k]}" "${WHY[k]}"
 done
 echo
+if [ "$n_hard_skipped" -gt 0 ]; then
+  echo "Skipped $n_hard_skipped live/locked/in use — force one with -F <name>, or everything with -A."
+fi
 if [ "$n_dirty_skipped" -gt 0 ]; then
   echo "Skipped $n_dirty_skipped with uncommitted work — commit it, or rerun with -f to throw it away."
 fi
-if [ "$n_branch_hint" -gt 0 ]; then
+if [ "$n_branch_hint" -gt 0 ] && [ "$n_branch_hint_lossy" -eq 0 ]; then
   echo "Add -b to also delete the $n_branch_hint merged/pushed branch(es) (nothing is lost)."
+elif [ "$n_branch_hint" -gt 0 ]; then
+  echo "Add -b to also delete their $n_branch_hint branch(es) — $n_branch_hint_lossy with commits that would be lost."
 fi
 
 if [ "$n_remove" -eq 0 ]; then
@@ -233,19 +295,25 @@ if [ "$assume_yes" -eq 0 ]; then
 fi
 
 # --- remove ---
-failed=0
+failed=0 left_here=""
 for ((k=1; k<${#WT_PATH[@]}; k++)); do
   [ "${ACT[k]}" = "skip" ] && continue
   wt="${WT_PATH[k]}"
-  [ "${UNLOCK[k]}" -eq 1 ] && g worktree unlock "$wt"
-  if [ "${ACT[k]}" = "prune" ]; then continue; fi
-  if [ "${FORCE[k]}" -eq 1 ]; then rm_args=(--force); else rm_args=(); fi
-  if g worktree remove ${rm_args[@]+"${rm_args[@]}"} "$wt"; then
-    echo "Removed ${SHOW[k]}"
-  else
-    echo "Could not remove ${SHOW[k]} (see git's message above)" >&2
-    DEL_BR[k]=0; failed=1
+  if [ "${UNLOCK[k]}" -eq 1 ]; then g worktree unlock "$wt" 2>/dev/null || true; fi
+  if [ "${ACT[k]}" = "prune" ]; then
+    if [ "${FORCED[k]}" -eq 1 ] && [ -e "$wt" ] && safe_to_rm "$wt"; then rm -rf -- "$wt" || failed=1; fi
+    continue
   fi
+  if [ "${FORCE[k]}" -eq 1 ]; then rm_args=(--force); else rm_args=(); fi
+  if err="$(g worktree remove ${rm_args[@]+"${rm_args[@]}"} "$wt" 2>&1)"; then
+    echo "Removed ${SHOW[k]}"
+  elif [ "${FORCED[k]}" -eq 1 ] && safe_to_rm "$wt" && rm -rf -- "$wt"; then
+    echo "Removed ${SHOW[k]} (git refused, so deleted the folder directly)"
+  else
+    echo "Could not remove ${SHOW[k]}: $err" >&2
+    DEL_BR[k]=0; failed=1; continue
+  fi
+  [ "${IN_HERE[k]}" -eq 1 ] && left_here="${SHOW[k]}"
 done
 g worktree prune
 still_listed="$(g worktree list --porcelain)"
@@ -254,7 +322,7 @@ for ((k=1; k<${#WT_PATH[@]}; k++)); do
   if grep -qxF "worktree ${WT_PATH[k]}" <<<"$still_listed"; then
     echo "Could not prune ${SHOW[k]}" >&2; DEL_BR[k]=0; failed=1
   else
-    echo "Pruned ${SHOW[k]} (folder was already gone)"
+    echo "Pruned ${SHOW[k]}"
   fi
 done
 for ((k=1; k<${#WT_PATH[@]}; k++)); do
@@ -266,4 +334,7 @@ for ((k=1; k<${#WT_PATH[@]}; k++)); do
   fi
 done
 
+if [ -n "$left_here" ]; then
+  echo "Your shell is still in the deleted $left_here — run: cd $main_wt"
+fi
 [ "$failed" -eq 0 ] && echo "Done." || { echo "Done, with errors." >&2; exit 1; }
