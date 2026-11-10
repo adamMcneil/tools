@@ -1,9 +1,25 @@
 #!/usr/bin/env bash
-# Move files/folders from WSL to the Windows Desktop.
-# Usage: mtw <file>...      e.g.  mtw report.pdf *.csv
+# Move (or copy, with -c) files/folders from WSL to the Windows Desktop.
+# Usage: mtw [-c|--copy] <file>...   e.g.  mtw report.pdf *.csv
+#        -c, --copy   copy instead of move, so the originals stay in WSL
 # Asks before overwriting anything already on the Desktop.
-if [ $# -eq 0 ]; then
-  echo "usage: mtw <file>..." >&2
+usage() { echo "usage: mtw [-c|--copy] <file>..." >&2; }
+
+copy=false
+files=()
+while [ $# -gt 0 ]; do
+  case "$1" in
+    -c|--copy) copy=true ;;
+    -h|--help) usage; exit 0 ;;
+    --) shift; files+=("$@"); break ;;
+    -*) echo "mtw: unknown option: $1" >&2; usage; exit 1 ;;
+    *) files+=("$1") ;;
+  esac
+  shift
+done
+
+if [ ${#files[@]} -eq 0 ]; then
+  usage
   exit 1
 fi
 
@@ -15,4 +31,8 @@ if [ -z "$win_desktop" ]; then
 fi
 desktop="$(wslpath -u "$win_desktop")"
 
-mv -iv -- "$@" "$desktop"/
+if $copy; then
+  cp -riv --preserve=timestamps -- "${files[@]}" "$desktop"/
+else
+  mv -iv -- "${files[@]}" "$desktop"/
+fi
